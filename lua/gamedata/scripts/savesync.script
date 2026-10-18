@@ -14,6 +14,17 @@
   - Saves made without savesync have no record for the old host. Then their
     character (the actor) is captured as a client record first, and after ours
     is applied the game saves and loads once so xrRazom picks that record up.
+
+  Local patch (2026-10-17): reads and writes .xrr_peers v19 as well as v15
+  (xrRazom d2026.10.17 writes v19), and finds the loaded save in logs whose
+  lines carry a timestamp. v19 differences from v15, checked byte for byte
+  against real v19 files:
+  - no torch string; active slot is a u16 (was u32)
+  - each item ends with 2 extra bytes: firearms {fire mode index, 0xff/0},
+    everything else {0xff, 0xff}
+  - the always-0 byte after "needs" is now a string: the community the player
+    currently shows (disguise), e.g. "army"
+  - each record ends with 2 extra bytes {0, n}; n differs per player
 ]]
 
 local MAX_DEPTH = 8  -- same table depth limit xrRazom's codecs use
@@ -123,8 +134,15 @@ end
 
 ------------------------------------------------------------------ record encoder
 
+local PEERS_V15, PEERS_V19 = 15, 19
+local SUPPORTED_PEERS = { [PEERS_V15] = true, [PEERS_V19] = true }
+local DEFAULT_PEERS_VERSION = PEERS_V19  -- for a save that has no .xrr_peers yet
+
 -- `p` uses the same field names as tools/xrr_peers.py's JSON.
-function encode_peer(p)
+-- ver: .xrr_peers version to write (15 or 19; default 19).
+function encode_peer(p, ver)
+	ver = ver or DEFAULT_PEERS_VERSION
+	local v19 = ver >= PEERS_V19
 	local w = W.new()
 	w:cstr(p.name)
 	w:u64(p.steamid)
@@ -133,9 +151,9 @@ function encode_peer(p)
 	w:cstr(p.outfit)
 	w:cstr(p.helmet)
 	w:cstr(p.pda)
-	w:cstr(p.torch)
+	if not v19 then w:cstr(p.torch or "") end
 	w:cstr(p.active_weapon)
-	w:u32(p.active_slot)
+	if v19 then w:u16(p.active_slot) else w:u32(p.active_slot) end
 	w:cstr(p.level)
 	for i = 1, 3 do w:f32(p.position[i]) end
 	for i = 1, 2 do w:f32(p.unk_angles[i]) end
@@ -170,6 +188,10 @@ function encode_peer(p)
 			w:u8(0)
 		end
 		w:u16(it.unk_tail)
+		if v19 then
+			local ws = it.wpn_state or { 255, 255 }
+			w:u8(ws[1]) w:u8(ws[2])
+		end
 	end
 
 	w:i32(p.reputation)
@@ -181,7 +203,7 @@ function encode_peer(p)
 
 	w:cstr(p.stats)
 	w:cstr(p.needs)
-	w:u8(p.unk_u8_flags)
+	if v19 then w:cstr(p.disguise or "") else w:u8(p.unk_u8_flags or 0) end
 	w:u16(#p.flags)
 	for _, kv in ipairs(p.flags) do w:cstr(kv[1]) w:cstr(kv[2]) end
 	w:u16(#p.pstor)
@@ -190,6 +212,10 @@ function encode_peer(p)
 	for _, kv in ipairs(p.m_data) do w:sized(kv[1], kv[2]) end
 	w:u64(p.game_times[1])
 	w:u64(p.game_times[2])
+	if v19 then
+		local t = p.tail or { 0, 0 }
+		w:u8(t[1]) w:u8(t[2])
+	end
 	return w:bytes()
 end
 
@@ -284,7 +310,9 @@ function R:sized()
 end
 
 -- Inverse of encode_peer; returns the record and the position after it.
-function decode_peer(s, pos)
+function decode_peer(s, pos, ver)
+	ver = ver or DEFAULT_PEERS_VERSION
+	local v19 = ver >= PEERS_V19
 	local r = R.new(s, pos)
 	local p = {}
 	p.name = r:cstr()
@@ -294,9 +322,9 @@ function decode_peer(s, pos)
 	p.outfit = r:cstr()
 	p.helmet = r:cstr()
 	p.pda = r:cstr()
-	p.torch = r:cstr()
+	p.torch = v19 and "" or r:cstr()
 	p.active_weapon = r:cstr()
-	p.active_slot = r:u32()
+	p.active_slot = v19 and r:u16() or r:u32()
 	p.level = r:cstr()
 	p.position = { r:f32(), r:f32(), r:f32() }
 	p.unk_angles = { r:f32(), r:f32() }
@@ -330,6 +358,7 @@ function decode_peer(s, pos)
 			assert(r.p == start + n, "item data length mismatch for " .. it.section)
 		end
 		it.unk_tail = r:u16()
+		if v19 then it.wpn_state = { r:u8(), r:u8() } end
 		p.items[i] = it
 	end
 
@@ -341,7 +370,12 @@ function decode_peer(s, pos)
 	for i = 1, r:u16() do p.npc_relations[i] = { r:u16(), r:i32() } end
 	p.stats = r:cstr()
 	p.needs = r:cstr()
-	p.unk_u8_flags = r:u8()
+	if v19 then
+		p.disguise = r:cstr()
+	else
+		p.unk_u8_flags = r:u8()
+		p.disguise = ""
+	end
 	p.flags = {}
 	for i = 1, r:u16() do p.flags[i] = { r:cstr(), r:cstr() } end
 	p.pstor = {}
@@ -349,6 +383,7 @@ function decode_peer(s, pos)
 	p.m_data = {}
 	for i = 1, r:u16() do p.m_data[i] = r:sized() end
 	p.game_times = { r:u64(), r:u64() }
+	if v19 then p.tail = { r:u8(), r:u8() } end
 	return p, r.p
 end
 
@@ -449,10 +484,17 @@ local function collect_item(item, slots, mdata_keys, m)
 		item:iterate_installed_upgrades(function(u) upgrades[#upgrades + 1] = u end)
 	end
 
+	-- v19 per-item pair: firearms carry {fire mode index, 0xff}, everything else
+	-- {0xff, 0xff}. The live fire mode isn't readable reliably from Lua, so the
+	-- first mode (index 0, always valid) is recorded.
+	local firearm = IsWeapon(item) and not IsMelee(item)
+		and not (IsGrenade and IsGrenade(item))
+	local wpn_state = firearm and { 0, 255 } or { 255, 255 }
+
 	return {
 		id = id, section = item:section(), count = count, condition = item:condition(),
 		ammo_in_mag = mag, slot = slot, place = place, uses = uses, upgrades = upgrades,
-		data = data, unk_tail = 0,
+		data = data, unk_tail = 0, wpn_state = wpn_state,
 	}
 end
 
@@ -523,6 +565,11 @@ function collect_peer(name)
 	local pos = actor:position()
 	local heading = actor:direction():getH()
 
+	-- Community the player shows right now (differs from faction while disguised);
+	-- the same value xrRazom's disguise sync reports, without the "actor_" prefix.
+	local shown = actor:character_community() or ""
+	shown = shown:match("^actor_(.+)") or shown
+
 	return {
 		name = name,
 		steamid = 0,  -- filled in by savesync.dll
@@ -553,16 +600,17 @@ function collect_peer(name)
 		stats = xrr_net_client and xrr_net_client.xrr_collect_stats_blob() or "",
 		needs = xrr_net_client and xrr_net_client.xrr_collect_condition_blob() or "",
 		unk_u8_flags = 0,
+		disguise = shown,
 		flags = {},
 		pstor = pstor,
 		m_data = mdata,
-		game_times = { 0, 0 },  -- filled in by savesync.dll from the other records
+		game_times = { 0, 0 },  -- copied from the other records in with_records()
+		tail = { 0, 0 },        -- v19; set in with_records()
 	}
 end
 
 ------------------------------------------------------------------ save file plumbing
 
-local PEERS_VERSION = 15
 local function my_name()
 	return get_console_cmd(0, "xrr_player_name") or ""
 end
@@ -591,29 +639,68 @@ local function log(fmt, ...)
 	printf("[savesync] " .. fmt, ...)
 end
 
--- Name of the save that was just loaded. Scripts aren't told, but the engine
--- logs "* Game <name> is successfully loaded from file ..." (lowercased), so
--- read it back from the newest log and match it to the real file name.
-local function loaded_save()
-	if flush then flush() end
-	local logs = getFS():file_list_open_ex("$logs$", bit_or(FS.FS_ListFiles, FS.FS_RootOnly), "*.log")
-	local newest, newest_modif
-	for i = 0, logs:Size() - 1 do
-		local f = logs:GetAt(i)
-		local modif = tonumber(f:Modif()) or 0
-		if not newest or modif > newest_modif then newest, newest_modif = f:NameFull(), modif end
-	end
-	local text = newest and read_file(getFS():update_path("$logs$", "") .. newest)
-	if not text then return nil end
-	local name
-	for n in text:gmatch("%* Game (.-) is successfully loaded from file") do name = n end
-	if not name then return nil end
+-- Real file name (case as on disk) for a lowercased save name, or nil.
+local function real_save_name(lower)
 	local saves = getFS():file_list_open_ex("$game_saves$", bit_or(FS.FS_ListFiles, FS.FS_RootOnly), "*.scop")
 	for i = 0, saves:Size() - 1 do
 		local real = saves:GetAt(i):NameFull():gsub("%.scop$", "")
-		if real:lower() == name then return real end
+		if real:lower() == lower then return real end
 	end
-	return name
+end
+
+-- Last "Game <name> is successfully loaded" in a log text: name, and the
+-- line's time of day in seconds when it has a timestamp. Newer exes put the
+-- timestamp between the "*" and "Game" ("* [20:13:41.139]  Game ..."), which the
+-- old "%* Game" pattern never matched.
+function last_loaded_in_log(text)
+	local name, secs
+	for line in text:gmatch("[^\r\n]+") do
+		local n = line:match("Game (.-) is successfully loaded from file")
+		if n then
+			name, secs = n, nil
+			local h, m, s = line:match("%[(%d%d):(%d%d):(%d%d)")
+			if h then secs = tonumber(h) * 3600 + tonumber(m) * 60 + tonumber(s) end
+		end
+	end
+	return name, secs
+end
+
+-- True if a log time of day is within the last few minutes (handles midnight).
+local function is_recent(secs)
+	if not secs then return true end  -- no timestamp in this log format
+	local t = os.date("*t")
+	local now = t.hour * 3600 + t.min * 60 + t.sec
+	return (now - secs) % 86400 <= 300
+end
+
+-- Name of the save that was just loaded. Scripts aren't told (and the Lua state
+-- is rebuilt on load, so a "load" console command can't be remembered), but the
+-- engine logs "Game <name> is successfully loaded from file ..." (lowercased),
+-- so read it back from the logs (newest first) and match it to the real name.
+local function loaded_save()
+	if flush then pcall(flush) end
+	local logs = getFS():file_list_open_ex("$logs$", bit_or(FS.FS_ListFiles, FS.FS_RootOnly), "*.log")
+	local list = {}
+	for i = 0, logs:Size() - 1 do
+		local f = logs:GetAt(i)
+		list[#list + 1] = { name = f:NameFull(), modif = tonumber(f:Modif()) or 0 }
+	end
+	table.sort(list, function(a, b) return a.modif > b.modif end)
+	local dir = getFS():update_path("$logs$", "")
+	for _, f in ipairs(list) do
+		local text = read_file(dir .. f.name)
+		if text then
+			local name, secs = last_loaded_in_log(text)
+			if name then
+				if not is_recent(secs) then
+					log("last load in %s is older than 5 minutes ('%s'); ignoring it", f.name, name)
+					return nil
+				end
+				return real_save_name(name) or name
+			end
+		end
+	end
+	return nil
 end
 
 -- Newest save (by .scop time) as { name, modif }.
@@ -630,27 +717,36 @@ local function newest_save()
 	return best
 end
 
--- .xrr_peers -> list of { name, raw, record }; nil + error if it isn't a v15 file.
--- A missing file is an empty list.
+-- .xrr_peers -> list of { name, raw, record }, version; nil + error if it isn't a
+-- supported file (v15 or v19) or doesn't decode exactly to its end.
+-- A missing file is an empty list (version nil).
 function read_peers_string(s)
-	if not s then return {} end
+	if not s then return {}, nil end
 	if s:sub(1, 4) ~= "XPRR" then return nil, "not an .xrr_peers file" end
 	local r = R.new(s, 5)
 	local version, count = r:u32(), r:u32()
-	if version ~= PEERS_VERSION then return nil, "unsupported .xrr_peers version " .. version end
-	local out, pos = {}, r.p
-	for i = 1, count do
-		local p, next_pos = decode_peer(s, pos)
-		out[i] = { name = p.name, raw = s:sub(pos, next_pos - 1), record = p }
-		pos = next_pos
+	if not SUPPORTED_PEERS[version] then
+		return nil, "unsupported .xrr_peers version " .. version .. " (savesync knows 15 and 19)"
 	end
-	return out
+	local out, pos = {}, r.p
+	local ok, err = pcall(function()
+		for i = 1, count do
+			local p, next_pos = decode_peer(s, pos, version)
+			out[i] = { name = p.name, raw = s:sub(pos, next_pos - 1), record = p }
+			pos = next_pos
+		end
+	end)
+	if not ok then return nil, "can't decode v" .. version .. " records: " .. tostring(err) end
+	if pos ~= #s + 1 then
+		return nil, ("v%d layout mismatch: %d bytes left over"):format(version, #s + 1 - pos)
+	end
+	return out, version
 end
 
-function peers_bytes(peers)
+function peers_bytes(peers, version)
 	local w = W.new()
 	w:raw("XPRR")
-	w:u32(PEERS_VERSION)
+	w:u32(version or DEFAULT_PEERS_VERSION)
 	w:u32(#peers)
 	for _, p in ipairs(peers) do w:raw(p.raw) end
 	return w:bytes()
@@ -668,29 +764,51 @@ local function names_of(t)
 	return names
 end
 
--- Returns peers file bytes with each record in `add` (name -> bytes) stored under
--- its name, replacing any old one. SteamID and game times can't round-trip a Lua
--- number, so they're copied as raw bytes from records already in the file.
+-- Returns peers file bytes with each record in `add` (name -> record table, as
+-- collect_peer returns) stored under its name, replacing any old one, in the
+-- file's own format version. SteamID and game times can't round-trip a Lua
+-- number, so they're copied as raw bytes from records already in the file; in
+-- v19 the per-player trailing pair is kept from that player's old record, or
+-- given the next free number for a new one.
 function with_records(s, add)
-	local peers, err = read_peers_string(s)
-	if not peers then return nil, err end
-	local steamids, times = {}, nil
+	local peers, version = read_peers_string(s)
+	if not peers then return nil, version end
+	version = version or DEFAULT_PEERS_VERSION
+	local v19 = version >= PEERS_V19
+	local tail_len = v19 and 2 or 0
+	local steamids, tails, times, max_tail = {}, {}, nil, 0
 	local out = {}
 	for _, p in ipairs(peers) do
+		local t = p.record.tail
+		if t and t[2] > max_tail then max_tail = t[2] end
 		if add[p.name] then
 			steamids[p.name] = p.raw:sub(#p.name + 2, #p.name + 9)
+			tails[p.name] = t
 		else
-			times = times or p.raw:sub(-16)
+			times = times or p.raw:sub(-16 - tail_len, -1 - tail_len)
 			out[#out + 1] = p
 		end
 	end
 	for _, name in ipairs(names_of(add)) do
-		local rec, n = add[name], #name + 1
-		local raw = rec:sub(1, n) .. (steamids[name] or string.rep("\0", 8)) .. rec:sub(n + 9)
-		if times then raw = raw:sub(1, -17) .. times end
+		local rec = {}
+		for k, v in pairs(add[name]) do rec[k] = v end
+		rec.name, rec.steamid = name, 0
+		if v19 then
+			if tails[name] then
+				rec.tail = tails[name]
+			else
+				max_tail = math.min(max_tail + 1, 255)
+				rec.tail = { 0, max_tail }
+			end
+		end
+		local bytes, n = encode_peer(rec, version), #name + 1
+		local raw = bytes:sub(1, n) .. (steamids[name] or string.rep("\0", 8)) .. bytes:sub(n + 9)
+		if times then
+			raw = raw:sub(1, -17 - tail_len) .. times .. (tail_len > 0 and raw:sub(-tail_len) or "")
+		end
 		out[#out + 1] = { name = name, raw = raw }
 	end
-	return peers_bytes(out), #out
+	return peers_bytes(out, version), #out
 end
 
 local function patch_save(path, add)
@@ -712,7 +830,11 @@ local function on_save_state()
 
 	-- Collect now, while the actor is exactly what's being saved.
 	collecting = true
-	local okc, record = pcall(function() return encode_peer(collect_peer(me)) end)
+	local okc, record = pcall(function()
+		local p = collect_peer(me)
+		encode_peer(p)  -- fail here, not later, if something can't be encoded
+		return p
+	end)
 	collecting = false
 	if not okc then
 		printe("![savesync] collecting own character failed: %s", tostring(record))
@@ -791,14 +913,18 @@ local function finish_items(pending)
 	return left
 end
 
-local function apply_items(p, on_done)
+local function swap_items(p, on_done, keep_id)
 	local m = alife_storage_manager.get_state()
 	local old = {}
 	db.actor:iterate_inventory(function(_, item)
-		if item:section() ~= "device_torch_dummy" then old[#old + 1] = item:id() end
+		local id = item:id()
+		if item:section() ~= "device_torch_dummy" and id ~= keep_id
+			and (not alife_object or alife_object(id)) then
+			old[#old + 1] = id
+		end
 	end, db.actor)
 	for _, id in ipairs(old) do alife_release_id(id) end
-	log("removed %s inherited items", #old)
+	log("removed %s inherited items%s", #old, keep_id and " (kept the one in hand)" or "")
 
 	local pending, spawned = {}, 0
 	for _, it in ipairs(p.items) do
@@ -839,6 +965,27 @@ local function apply_items(p, on_done)
 			return true
 		end
 		return false
+	end)
+end
+
+-- Put the weapon in hand away before swapping inventories. Releasing the item
+-- in hand leaves it "active" for a frame after its data is gone, and mods that
+-- look at the active weapon every frame (Weapon Parts Overhaul's arti_jamming
+-- reads its parts) crash on it. Waits up to 3 s; if it's still in hand then,
+-- that one item is kept rather than risk the crash.
+local function apply_items(p, on_done)
+	local actor = db.actor
+	if not actor:active_item() then return swap_items(p, on_done) end
+	pcall(function() actor:activate_slot(0) end)  -- 0 = no active slot (holster)
+	local deadline = time_global() + 3000
+	CreateTimeEvent("savesync", "holster", 0, function()
+		local held = db.actor:active_item()
+		if held and time_global() < deadline then return false end
+		local keep = held and held:id() or nil
+		if keep then printe("![savesync] couldn't put away %s; keeping it", held:section()) end
+		local ok, err = pcall(swap_items, p, on_done, keep)
+		if not ok then printe("![savesync] apply step 'items' failed: %s", tostring(err)) end
+		return true
 	end)
 end
 
@@ -891,6 +1038,23 @@ local function apply_character(p)
 		for _, kv in ipairs(p.m_data) do surrogate[kv[1]] = to_native(kv[2]) end
 		xrr_peer_mdata_apply(surrogate)
 	end)
+	-- v19 records carry the community the player was showing (disguise). Put it
+	-- back the way xrRazom's own disguise restore does (gameplay_disguise.set_comm),
+	-- which also drops the old host's disguise when ours is our own faction.
+	step("disguise", function()
+		local want = (p.disguise and p.disguise ~= "") and p.disguise or p.faction
+		if not want or want == "" then return end
+		local cur = actor:character_community() or ""
+		cur = cur:match("^actor_(.+)") or cur
+		if cur == want then return end
+		local gd = gameplay_disguise
+		if gd and gd.set_comm then
+			gd.set_comm(want)
+		else
+			actor:set_character_community("actor_" .. want, 0, 0)
+		end
+		log("community set to %s (faction %s)", want, p.faction)
+	end)
 end
 
 -- Take over a save someone else hosted. The save's character name is its host's
@@ -905,6 +1069,7 @@ local function try_take_over(owner)
 		log("can't tell which save was loaded; not taking over")
 		return
 	end
+	log("loaded save is '%s' (hosted by '%s')", name, owner)
 
 	local path = saves_dir() .. name .. ".xrr_peers"
 	local peers, err = read_peers_string(read_file(path))
@@ -934,7 +1099,11 @@ local function try_take_over(owner)
 	-- keep it as a client record, then save and load once, because xrRazom only
 	-- reads .xrr_peers on load and the old host needs it there to rejoin.
 	collecting = true
-	local okc, record = pcall(function() return encode_peer(collect_peer(owner)) end)
+	local okc, record = pcall(function()
+		local p = collect_peer(owner)
+		encode_peer(p)  -- fail here, not at save time, if it can't be encoded
+		return p
+	end)
 	collecting = false
 	if not okc then error(record, 0) end
 	captured = { name = owner, record = record }
